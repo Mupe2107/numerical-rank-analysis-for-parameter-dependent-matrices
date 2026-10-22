@@ -1,0 +1,435 @@
+"""
+Нумерички ранг матрице зависне од параметра — општи случај
+===========================================================
+
+Улаз (једно од два):
+  * матрица M(p, p̄)   -> A = M M^H,  k(λ) = det(λI − A) = Σ a_k(p, p̄) λ^k
+  * директно коефицијенти a_0(p, p̄), …, a_n(p, p̄) карактеристичног полинома
+    неке хермитске позитивно семидефинитне матрице
+и путања p = p(θ), θ ∈ [θ_a, θ_b] ⊂ ℝ.
+
+Поступак (као у документу):
+  1. Виртингерови изводи:  da_k/dθ = 2·Re{ ∂a_k/∂p · p'(θ) }
+  2. Једначина (а):        dλ/dθ = F(λ, θ) = − Σ_k (da_k/dθ) λ^k / k'(λ)
+  3. Почетни услови:        λ_i(θ_a) = корени k(λ) у θ_a,   i = 1, …, n
+  4. Свака грана се прати корак по корак: предиктор RK4 + коректор Њутн
+  5. Поређење грана:       r(θ) = #{ i : λ_i(θ) > τ² }
+     -> ранг по интервалима параметра и тачке у којима ранг пада
+
+Употреба:
+    import sympy as sp
+    from rang_opste import p, pb, analiziraj
+
+    M = sp.Matrix([[1, p], [pb, 1]])          # pb означава p̄
+    rez = analiziraj(M, p_put=lambda t: t, theta_a=-2, theta_b=2)
+
+Матрица се може писати и са sp.conjugate(p) уместо pb.
+"""
+
+import warnings
+import numpy as np
+import sympy as sp
+from scipy.optimize import linear_sum_assignment, minimize_scalar
+
+# p и p̄ као НЕЗАВИСНИ симболи -> sympy диференцира по Виртингеру
+p, pb = sp.symbols('p pb')
+lam = sp.Symbol('lambda')
+
+
+# ============================================================
+# ПОМОЋНЕ ФУНКЦИЈЕ
+# ============================================================
+
+def _u_p_pb(expr):
+    """conjugate(p) -> pb, да би p и p̄ били два независна симбола."""
+    return sp.sympify(expr).subs(sp.conjugate(p), pb)
+
+
+def konjugat(expr):
+    """Конјугат израза у (p, p̄): j -> −j и p <-> p̄."""
+    e = sp.conjugate(_u_p_pb(expr))
+    return e.subs({sp.conjugate(p): pb, sp.conjugate(pb): p}, simultaneous=True)
+
+
+def _brza_funkcija(izrazi):
+    """Листа израза у (p, p̄) -> функција (P, P̄) -> numpy низ."""
+    g = sp.lambdify((p, pb), list(izrazi), 'numpy', cse=True)
+    return lambda P, Pc: np.array(g(P, Pc), dtype=complex)
+
+
+# ============================================================
+# ПОЛИНОМ k(λ; θ) И ЈЕДНАЧИНА (а)
+# ============================================================
+
+class Polinom:
+    """k(λ) = Σ a_k(p, p̄) λ^k дуж путање p = p(θ)."""
+
+    def __init__(self, a_sym, p_put, dp_put=None, A_sym=None):
+        self.a_sym = [_u_p_pb(c) for c in a_sym]                 # a_0 … a_n
+        self.da_sym = [sp.diff(c, p) for c in self.a_sym]        # ∂a_k/∂p
+        self._a = _brza_funkcija(self.a_sym)
+        self._da = _brza_funkcija(self.da_sym)
+        self._A = sp.lambdify((p, pb), A_sym, 'numpy') if A_sym is not None else None
+        self.n_puno = len(self.a_sym) - 1
+
+        self.p_put = p_put
+        if dp_put is None:                                       # централна разлика
+            d = 1e-6
+            dp_put = lambda t: (p_put(t + d) - p_put(t - d)) / (2 * d)
+        self.dp_put = dp_put
+        self.q = 0          # број тривијалних нула (a_0 ≡ … ≡ a_{q−1} ≡ 0)
+        self._kes = {}
+
+    @classmethod
+    def iz_matrice(cls, M, p_put, dp_put=None, oblik='MMH'):
+        """
+        oblik = 'MMH' (као у документу), 'MHM' или 'auto' (мања димензија).
+        Ненулти корени су у сва три случаја исти.
+        """
+        M = sp.Matrix(M).applyfunc(_u_p_pb)
+        MH = M.T.applyfunc(konjugat)
+        m, n = M.shape
+        if oblik == 'auto':
+            oblik = 'MMH' if m <= n else 'MHM'
+        A = M * MH if oblik == 'MMH' else MH * M
+        a_sym = A.charpoly(lam).all_coeffs()[::-1]               # det(λI − A)
+        obj = cls(a_sym, p_put, dp_put, A_sym=A)
+        obj.oblik_matrice = (m, n, oblik)
+        return obj
+
+    # --- коефицијенти у тачки θ ---
+
+    def koeficijenti(self, theta):
+        """a_k(θ) и da_k/dθ = 2·Re{∂a_k/∂p · p'(θ)}  (без тривијалних нула)."""
+        kljuc = (float(theta), self.q)
+        if kljuc not in self._kes:
+            if len(self._kes) > 64:
+                self._kes.clear()
+            P, dP = self.p_put(theta), self.dp_put(theta)
+            a = np.real(self._a(P, np.conj(P)))                  # a_k су реални
+            adot = 2.0 * np.real(self._da(P, np.conj(P)) * dP)   # Виртингер
+            self._kes[kljuc] = (a[self.q:], adot[self.q:])
+        return self._kes[kljuc]
+
+    def k(self, l, theta):
+        a, _ = self.koeficijenti(theta)
+        return np.polyval(a[::-1], l)
+
+    def kprim(self, l, theta):
+        a, _ = self.koeficijenti(theta)
+        return np.polyval(np.polyder(a[::-1]), l)
+
+    def koreni(self, theta):
+        a, _ = self.koeficijenti(theta)
+        r = np.roots(a[::-1])
+        if np.max(np.abs(r.imag), initial=0) > 1e-6 * (1 + np.max(np.abs(r), initial=0)):
+            warnings.warn(f'Комплексни корени у θ = {theta:.4g}: да ли је полином '
+                          f'од хермитске позитивно семидефинитне матрице?')
+        return np.sort(r.real)[::-1]
+
+    def odredi_q(self, theta_a, theta_b, uzoraka=9, tol=1e-10):
+        """Колико најнижих коефицијената је идентички нула на интервалу."""
+        self.q = 0
+        T = np.linspace(theta_a, theta_b, uzoraka)
+        a = np.array([self.koeficijenti(t)[0] for t in T])
+        skala = np.max(np.abs(a))
+        q = 0
+        while q < self.n_puno and np.max(np.abs(a[:, q])) < tol * skala:
+            q += 1
+        self.q = q
+        self._kes.clear()
+        return q
+
+    # --- једначина (а) ---
+
+    def F(self, l, theta):
+        """dλ/dθ = − Σ (da_k/dθ) λ^k / k'(λ)"""
+        a, adot = self.koeficijenti(theta)
+        return -np.polyval(adot[::-1], l) / np.polyval(np.polyder(a[::-1]), l)
+
+    def njutn(self, l, theta, iteracija=2):
+        for _ in range(iteracija):
+            l = l - self.k(l, theta) / self.kprim(l, theta)
+        return l
+
+    def korak(self, l, theta, h, iteracija=2):
+        """Предиктор RK4 + коректор Њутн."""
+        k1 = self.F(l, theta)
+        k2 = self.F(l + h / 2 * k1, theta + h / 2)
+        k3 = self.F(l + h / 2 * k2, theta + h / 2)
+        k4 = self.F(l + h * k3, theta + h)
+        l = l + h / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+        return self.njutn(l, theta + h, iteracija)
+
+
+# ============================================================
+# ПРАЋЕЊЕ ГРАНА
+# ============================================================
+
+def prati_grane(pol, theta_a, theta_b, h=1e-3, iteracija=2, tol_sync=1e-6):
+    """
+    Решава n почетних проблема dλ_i/dθ = F(λ_i, θ), λ_i(θ_a) = корени у θ_a.
+    После сваког корака стање се упореди са директним коренима; ако је
+    грана одлутала (k' ≈ 0, пресек грана), ресинхронизује се и то се бележи.
+    """
+    q = pol.odredi_q(theta_a, theta_b)
+    n = pol.n_puno - q
+    J = int(np.ceil((theta_b - theta_a) / h))
+    T = np.linspace(theta_a, theta_b, J + 1)
+    L = np.zeros((J + 1, n))
+    L[0] = pol.koreni(theta_a)
+    resinhronizacije = []
+
+    for j in range(J):
+        hj = T[j + 1] - T[j]
+        with np.errstate(all='ignore'):
+            novo = np.array([pol.korak(L[j, i], T[j], hj, iteracija) for i in range(n)])
+        r = pol.koreni(T[j + 1])
+        poredi = np.where(np.isfinite(novo), novo, L[j])
+        red, kol = linear_sum_assignment(np.abs(poredi[:, None] - r[None, :]))
+        r_par = np.empty(n)
+        r_par[red] = r[kol]
+        with np.errstate(all='ignore'):
+            odst = np.abs(novo - r_par) / (1 + np.abs(r_par))
+        if not np.all(np.isfinite(novo)) or np.any(odst > tol_sync):
+            resinhronizacije.append(T[j + 1])
+            novo = r_par
+        L[j + 1] = novo
+
+    return dict(theta=T, lam=L, q=q, resinhronizacije=resinhronizacije)
+
+
+# ============================================================
+# ПОРЕЂЕЊЕ ГРАНА И РАНГ
+# ============================================================
+
+def _lokalni_minimumi(pol, grane):
+    """Локални минимуми сваке гране, прецизирани између тачака мреже."""
+    T, L = grane['theta'], grane['lam']
+    out = []
+    for i in range(L.shape[1]):
+        y = L[:, i]
+        for j in range(1, len(T) - 1):
+            if y[j] <= y[j - 1] and y[j] < y[j + 1]:
+                f = lambda t, l0=y[j]: pol.njutn(l0, t, 6)
+                s = minimize_scalar(f, bounds=(T[j - 1], T[j + 1]), method='bounded',
+                                    options={'xatol': 1e-12})
+                # θ* је тачно до ~1e-7 (λ ≈ c(θ−θ*)² је раван око минимума)
+                out.append(dict(grana=i, theta=float(np.round(s.x, 7)) + 0.0,
+                                lam=max(float(s.fun), 0.0), j=j))
+    return out
+
+
+def odredi_rang(pol, grane, tau=None):
+    """
+    r(θ) = #{ i : λ_i(θ) > τ² }.
+    tau = None -> τ = 1e-6 · σ_max. (σ се добија као √λ, па се мање σ од
+    ~√ε · σ_max не могу поуздано разликовати од нуле.)
+    Враћа ранг на мрежи, интервале константног ранга и изоловане тачке у
+    којима ранг пада између тачака мреже.
+    """
+    T, L = grane['theta'], grane['lam']
+    if tau is None:
+        tau = 1e-6 * np.sqrt(np.max(L))
+    prag = tau ** 2
+    r = np.sum(L > prag, axis=1)
+
+    # интервали на мрежи на којима је r константан
+    intervali = []
+    pocetak = 0
+    for j in range(1, len(T) + 1):
+        if j == len(T) or r[j] != r[pocetak]:
+            intervali.append(dict(od=T[pocetak], do=T[j - 1], r=int(r[pocetak])))
+            pocetak = j
+
+    # изоловане тачке: минимуми грана испод прага између тачака мреже
+    tacke = []
+    for mn in _lokalni_minimumi(pol, grane):
+        if mn['lam'] > prag:
+            continue
+        sve = np.array([pol.njutn(l0, mn['theta'], 6) for l0 in L[mn['j']]])
+        if r[mn['j']] <= np.sum(sve > prag):
+            continue          # тај пад ранга већ се види на мрежи (интервал)
+        tacke.append(dict(theta=mn['theta'], grana=mn['grana'], lam=mn['lam'],
+                          r=int(np.sum(sve > prag))))
+    # исту тачку може да пријави више грана -> споји
+    tacke.sort(key=lambda t: t['theta'])
+    spojene = []
+    for t in tacke:
+        if spojene and abs(t['theta'] - spojene[-1]['theta']) < 1e-7:
+            spojene[-1]['grane'].append(t['grana'])
+            spojene[-1]['r'] = min(spojene[-1]['r'], t['r'])
+        else:
+            spojene.append(dict(theta=t['theta'], r=t['r'], grane=[t['grana']]))
+
+    r_min = min([int(r.min())] + [t['r'] for t in spojene])
+    # где је ранг минималан: интервали на мрежи + прецизиране тачке
+    # (тачка мреже која је погодила исти пад као прецизирана тачка се не понавља)
+    dh = 1.5 * (T[1] - T[0])
+    gde = [(t['theta'], t['theta']) for t in spojene if t['r'] == r_min]
+    for i in intervali:
+        if i['r'] != r_min:
+            continue
+        if i['od'] == i['do'] and any(abs(i['od'] - t['theta']) < dh for t in spojene):
+            continue
+        gde.append((i['od'], i['do']))
+    gde.sort()
+    return dict(tau=tau, r=r, r_min=r_min, r_max=int(r.max()),
+                intervali=intervali, tacke=spojene, gde_je_minimalan=gde)
+
+
+def provera_eig(pol, grane, svaki=25):
+    """Одступање праћених λ од eigvalsh(A(θ)) — ако је задата матрица."""
+    if pol._A is None:
+        return None
+    T, L = grane['theta'], grane['lam']
+    n = L.shape[1]
+    g = 0.0
+    for j in range(0, len(T), svaki):
+        P = pol.p_put(T[j])
+        ev = np.sort(np.linalg.eigvalsh(np.array(pol._A(P, np.conj(P)), complex)))[::-1][:n]
+        g = max(g, np.max(np.abs(np.sort(L[j])[::-1] - ev)))
+    return g
+
+
+# ============================================================
+# ИЗВЕШТАЈ И ГРАФИК
+# ============================================================
+
+def izvestaj(naslov, pol, grane, rang, jedinica=''):
+    f = lambda x: f'{x:.6g}{jedinica}'
+    print('=' * 64)
+    print(naslov)
+    print('=' * 64)
+    if hasattr(pol, 'oblik_matrice'):
+        m, n, ob = pol.oblik_matrice
+        print(f'M је {m}×{n}, A = {"M M^H" if ob == "MMH" else "M^H M"}')
+    print(f'степен k(λ): {pol.n_puno}, тривијалних нула q = {grane["q"]}, '
+          f'праћено грана: {grane["lam"].shape[1]}')
+    rs = grane['resinhronizacije']
+    print(f"ресинхронизација (k' ≈ 0): {len(rs)}"
+          + (f"  у θ ≈ {', '.join(f(x) for x in rs[:6])}" if rs else ''))
+    g = provera_eig(pol, grane)
+    if g is not None:
+        print(f'провера према eigvalsh: max |Δλ| = {g:.1e}')
+    print(f'τ = {rang["tau"]:.3e}   (τ² = {rang["tau"] ** 2:.3e})')
+    print('\nРанг по интервалима (на мрежи):')
+    for i in rang['intervali']:
+        print(f'  θ ∈ [{f(i["od"])}, {f(i["do"])}]   r = {i["r"]}')
+    if rang['tacke']:
+        print('Тачке у којима ранг пада (између тачака мреже):')
+        for t in rang['tacke']:
+            gr = ', '.join(str(g + 1) for g in t['grane'])
+            print(f'  θ* = {f(t["theta"])}   r = {t["r"]}   (грана {gr})')
+    print(f'\nНумерички ранг: r_max = {rang["r_max"]}, r_min = {rang["r_min"]}')
+    print('r_min се достиже у:')
+    for a, b in rang['gde_je_minimalan']:
+        print(f'  θ = {f(a)}' if a == b else f'  θ ∈ [{f(a)}, {f(b)}]')
+    print()
+
+
+def nacrtaj(grane, rang, naslov='', fajl=None, x_skala=1.0, x_oznaka=r'$\theta$'):
+    import matplotlib.pyplot as plt
+    boje = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4',
+            '#008300', '#4a3aa7', '#e34948']
+    T = grane['theta'] * x_skala
+    L = grane['lam']
+    fig, (a1, a2) = plt.subplots(2, 1, figsize=(10, 7), sharex=True,
+                                 gridspec_kw=dict(height_ratios=[3, 1]))
+    for i in range(L.shape[1]):
+        a1.semilogy(T, np.maximum(L[:, i], 1e-17), lw=2, color=boje[i % 8],
+                    label=rf'$\lambda_{i + 1}(\theta)$')
+    a1.axhline(rang['tau'] ** 2, color='#52514e', lw=1, ls='--', label=r'$\tau^2$')
+    for t in rang['tacke']:
+        x = t['theta'] * x_skala
+        a1.axvline(x, color='#c3c2b7', lw=1, zorder=0)
+        a2.plot(x, t['r'], 'o', ms=8, color='#0b0b0b')
+        a2.annotate(f'{x:.4g}', (x, t['r']), textcoords='offset points',
+                    xytext=(6, 4), fontsize=9)
+    a1.set_ylabel(r'$\lambda_i = \sigma_i^2$')
+    a1.set_title(naslov)
+    a1.legend(loc='lower right', frameon=False)
+    a2.step(T, rang['r'], where='mid', lw=2, color='#2a78d6')
+    a2.set_ylabel(r'$r(\theta)$')
+    a2.set_xlabel(x_oznaka)
+    a2.set_yticks(range(0, rang['r_max'] + 1))
+    a2.set_ylim(-0.3, rang['r_max'] + 0.5)
+    for ax in (a1, a2):
+        ax.grid(True, color='#e5e4e0', lw=0.6)
+        for s in ('top', 'right'):
+            ax.spines[s].set_visible(False)
+    fig.tight_layout()
+    if fajl:
+        fig.savefig(fajl, dpi=130)
+    plt.close(fig)
+
+
+# ============================================================
+# ЈЕДАН ПОЗИВ ЗА СВЕ
+# ============================================================
+
+def analiziraj(M=None, p_put=None, theta_a=0.0, theta_b=1.0, dp_put=None,
+               koeficijenti=None, tau=None, h=1e-3, oblik='MMH',
+               naslov='', fajl=None, ispis=True, jedinica='', x_skala=1.0,
+               x_oznaka=r'$\theta$'):
+    """
+    M            : sympy матрица у p и pb (или sp.conjugate(p))
+    koeficijenti : уместо M, листа [a_0, …, a_n] у p и pb
+    p_put        : θ -> p(θ);  dp_put: θ -> p'(θ) (опционо)
+    """
+    if M is not None:
+        pol = Polinom.iz_matrice(M, p_put, dp_put, oblik)
+    else:
+        pol = Polinom(koeficijenti, p_put, dp_put)
+    grane = prati_grane(pol, theta_a, theta_b, h)
+    rang = odredi_rang(pol, grane, tau)
+    if ispis:
+        izvestaj(naslov, pol, grane, rang, jedinica)
+    if fajl:
+        nacrtaj(grane, rang, naslov, fajl, x_skala, x_oznaka)
+    return dict(polinom=pol, grane=grane, rang=rang)
+
+
+# ============================================================
+# ПРИМЕРИ
+# ============================================================
+
+if __name__ == '__main__':
+    import os
+    import matplotlib
+    matplotlib.use('Agg')
+    os.makedirs('slike', exist_ok=True)
+
+    # 1) Реалан параметар: M = [[1, p], [p̄, 1]], λ = (1 ± |p|)².
+    #    Гране се секу у p = 0 (k' = 0), ранг пада са 2 на 1 у p = ±1.
+    analiziraj(sp.Matrix([[1, p], [pb, 1]]),
+               p_put=lambda t: t + 0j, dp_put=lambda t: 1 + 0j,
+               theta_a=-2, theta_b=2,
+               naslov='Пример 1: реалан параметар, M = [[1, p], [p̄, 1]]',
+               fajl='slike/primer1.png', x_oznaka='$p$')
+
+    # 2) Правоугаона 3×2 матрица, p на јединичној кружници.
+    #    Колоне [1,1,1] и [1,p,p²] су паралелне само за p = 1 (θ = 0).
+    #    A = M M^H је 3×3 -> једна тривијална нула (q = 1).
+    M2 = sp.Matrix([[1, 1], [1, p], [1, p ** 2]])
+    analiziraj(M2, p_put=lambda t: np.exp(1j * t), dp_put=lambda t: 1j * np.exp(1j * t),
+               theta_a=-np.pi, theta_b=np.pi,
+               naslov='Пример 2: правоугаона M (3×2), p = e^{jθ}',
+               fajl='slike/primer2.png', x_oznaka=r'$\theta$ [rad]')
+
+    # 3) 3×3 матрица у којој ранг пада на различитим местима за различит износ:
+    #    M = [[1, 1, 0], [1, p, 0], [0, 0, p + 1]],  p = e^{jθ}
+    #    det = (p − 1)(p + 1): ранг 3, пада на 2 у θ = 0 и θ = ±π.
+    M3 = sp.Matrix([[1, 1, 0], [1, p, 0], [0, 0, p + 1]])
+    analiziraj(M3, p_put=lambda t: np.exp(1j * t), dp_put=lambda t: 1j * np.exp(1j * t),
+               theta_a=-3.0, theta_b=3.2,
+               naslov='Пример 3: M = [[1,1,0],[1,p,0],[0,0,p+1]], p = e^{jθ}',
+               fajl='slike/primer3.png', x_oznaka=r'$\theta$ [rad]')
+
+    # 4) Задати директно коефицијенти: k(λ) = λ² − 4λ + |p − 1|²
+    #    (полином хермитске 2×2 матрице са трагом 4 и детерминантом |p − 1|²)
+    analiziraj(koeficijenti=[(p - 1) * (pb - 1), -4, 1],
+               p_put=lambda t: np.exp(1j * t), dp_put=lambda t: 1j * np.exp(1j * t),
+               theta_a=-np.pi / 2, theta_b=np.pi / 2,
+               naslov='Пример 4: задати коефицијенти, k(λ) = λ² − 4λ + |p − 1|²',
+               fajl='slike/primer4.png', x_oznaka=r'$\theta$ [rad]')
